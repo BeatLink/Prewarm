@@ -233,15 +233,30 @@ in
                 '';
             };
 
+            rotate = lib.mkOption {
+                type = lib.types.int;
+                default = 12;
+                description = ''
+                    How many samples accumulate into a generation before moving
+                    on to the next.
+
+                    This is what separates how often it looks from how long it
+                    remembers. Sampling often enough to catch a short-lived
+                    process should not also mean forgetting a library because
+                    nothing touched it for half an hour.
+                '';
+            };
+
             generations = lib.mkOption {
                 type = lib.types.int;
                 default = 6;
                 description = ''
-                    How many samples are kept. Each cycle overwrites the oldest,
-                    and the union of all of them is what gets warmed, so a page
-                    that stops being touched falls out after this many cycles.
+                    How many generations are kept. The oldest is overwritten
+                    when a new one opens, and the union of all of them is what
+                    gets warmed.
 
-                    With the default interval that is half an hour of history.
+                    Total retention is interval * rotate * generations. At the
+                    defaults, six hours, dropping the oldest hour at a time.
                 '';
             };
         };
@@ -280,6 +295,7 @@ in
             environment = environment // {
                 PREWARM_WATCH_INTERVAL = toString cfg.watch.interval;
                 PREWARM_WATCH_GENERATIONS = toString cfg.watch.generations;
+                PREWARM_WATCH_ROTATE = toString cfg.watch.rotate;
             };
             serviceConfig = {
                 Type = "simple";

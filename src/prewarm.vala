@@ -646,12 +646,29 @@ int main (string[] args) {
             generations = 1;
         }
 
+        /* How many samples accumulate into a generation before moving on to the
+         * next. Without this, retention and sampling frequency are the same
+         * knob: sampling often enough to catch a short-lived process would also
+         * mean forgetting everything within the hour, which is the opposite of
+         * what a preloader is for. Retention is
+         * generations * rotate * interval -- by default six hours. */
+        var rotate = 12;
+        var rotate_raw = Environment.get_variable ("PREWARM_WATCH_ROTATE");
+        if (rotate_raw != null) {
+            rotate = int.parse (rotate_raw);
+        }
+        if (rotate < 1) {
+            rotate = 1;
+        }
+
         if (DirUtils.create_with_parents (state_dir, 0775) != 0) {
             printerr ("prewarm: cannot create %s: %s\n", state_dir, Posix.strerror (Posix.errno));
             return 1;
         }
 
-        stdout.printf ("watching every %ds, %d generations\n", interval, generations);
+        stdout.printf ("watching every %ds, %d generations of %d samples -- %d minutes of history\n",
+                       interval, generations, rotate,
+                       (interval * rotate * generations) / 60);
         stdout.flush ();
 
         for (int cycle = 0; ; cycle++) {
@@ -692,23 +709,37 @@ int main (string[] args) {
                 printerr ("prewarm: /proc: %s\n", e.message);
             }
 
-            sample.merge ();
-
             /* Generations rather than one file that only ever grows. warm and
              * lock merge every profile in the directory, so the union of the
-             * generations is what gets used, and a page that stops being
-             * touched simply stops being rewritten and falls out after this
-             * many cycles. Decay with no bookkeeping -- and it is also what
-             * makes this survive an update, since paths that no longer exist
-             * stop appearing in samples. */
-            write_profile (Path.build_filename (state_dir,
-                                                "auto-%d.pages".printf (cycle % generations)),
-                           sample);
+             * generations is what gets used, and a generation that stops being
+             * added to falls out once it is overwritten. Decay with no
+             * bookkeeping -- and it is also what makes this survive an update,
+             * since paths that no longer exist stop appearing in samples.
+             *
+             * Each sample is folded into the current generation rather than
+             * replacing it, so a page seen once is remembered for the whole
+             * retention window and not just until the next sample. */
+            var generation = (cycle / rotate) % generations;
+            var path = Path.build_filename (state_dir, "auto-%d.pages".printf (generation));
+            var opening = (cycle % rotate) == 0;
 
-            stdout.printf ("generation %d: %u processes, %u regions in %u files, %"
+            if (!opening) {
+                var carried = read_profiles ({ path });
+                foreach (var existing in carried.order) {
+                    foreach (var r in carried.files.lookup (existing)) {
+                        sample.add (existing, r.off, r.len);
+                    }
+                }
+            }
+
+            sample.merge ();
+            write_profile (path, sample);
+
+            stdout.printf ("generation %d%s: %u processes, %u regions in %u files, %"
                            + uint64.FORMAT + " MiB\n",
-                           cycle % generations, sampled, sample.region_count (),
-                           sample.order.length, sample.total_bytes () / (1024 * 1024));
+                           generation, opening ? " (fresh)" : "", sampled,
+                           sample.region_count (), sample.order.length,
+                           sample.total_bytes () / (1024 * 1024));
             stdout.flush ();
 
             Posix.sleep (interval);
