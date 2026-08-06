@@ -812,14 +812,116 @@ int main (string[] args) {
             return 1;
         }
 
+        /* How long after a new process appears to wait before sampling. A
+         * launch is exactly when a profile is most wrong and most worth
+         * fixing, but sampling immediately catches a process that has not
+         * finished mapping its libraries or drawing its window. */
+        var settle = 20;
+        var settle_raw = Environment.get_variable ("PREWARM_WATCH_SETTLE");
+        if (settle_raw != null) {
+            settle = int.parse (settle_raw);
+        }
+        if (settle < 1) {
+            settle = 1;
+        }
+
+        /* Floor on how often a sample can be taken, so a shell loop or a build
+         * spawning processes cannot turn this into a busy loop. */
+        var min_gap = 60;
+        var gap_raw = Environment.get_variable ("PREWARM_WATCH_MIN_GAP");
+        if (gap_raw != null) {
+            min_gap = int.parse (gap_raw);
+        }
+        if (min_gap < 1) {
+            min_gap = 1;
+        }
+
         var auto_path = Path.build_filename (state_dir, "auto.pages");
 
-        stdout.printf ("watching every %ds, keeping pages for %" + int64.FORMAT + "h\n",
-                       interval, retention / 3600);
+        stdout.printf ("watching every %ds, %ds after a launch, keeping pages for %"
+                       + int64.FORMAT + "h\n", interval, settle, retention / 3600);
         stdout.flush ();
+
+        var seen_pids = new GenericSet<string> (str_hash, str_equal);
+        int64 next_scheduled = 0;
+        int64 armed = 0;
+        var armed_pids = new GenericArray<string> ();
+        var first_pass = true;
 
         while (true) {
             var stamp = new DateTime.now_utc ().to_unix ();
+
+            /* Watching /proc rather than subscribing to anything: a new process
+             * is the one signal available on every system, with no session bus,
+             * compositor or desktop environment assumed. Reading the directory
+             * costs nothing next to the sample it schedules. */
+            var live = new GenericSet<string> (str_hash, str_equal);
+            var fresh = new GenericArray<string> ();
+
+            try {
+                var scan = Dir.open ("/proc");
+                string? name;
+                while ((name = scan.read_name ()) != null) {
+                    if (!(name[0] >= '0' && name[0] <= '9')) {
+                        continue;
+                    }
+                    live.add (name);
+                    if (!first_pass && !seen_pids.contains (name)) {
+                        fresh.add (name);
+                    }
+                }
+            } catch (FileError e) {
+                printerr ("prewarm: /proc: %s\n", e.message);
+            }
+
+            seen_pids = live;
+
+            if (fresh.length > 0 && armed == 0) {
+                armed = stamp + settle;
+                armed_pids = fresh;
+            }
+
+            var due = (armed != 0 && stamp >= armed) || stamp >= next_scheduled;
+
+            if (!due) {
+                Posix.sleep (5);
+                continue;
+            }
+
+            if (stamp < next_scheduled - interval + min_gap) {
+                Posix.sleep (5);
+                continue;
+            }
+
+            var by_launch = (armed != 0 && stamp >= armed);
+
+            /* Only sample for a launch if something that triggered it is still
+             * running. Most new processes on a busy system are short-lived --
+             * a shell command, a helper, a timer -- and sampling for those
+             * would turn the interval floor into the sampling rate. Anything
+             * that outlives the settle period is the kind of thing worth
+             * recording, and has had time to map its libraries. */
+            if (by_launch) {
+                var survivor = false;
+                foreach (var candidate in armed_pids) {
+                    if (FileUtils.test ("/proc/" + candidate, FileTest.EXISTS)) {
+                        survivor = true;
+                        break;
+                    }
+                }
+
+                armed = 0;
+                armed_pids = new GenericArray<string> ();
+
+                if (!survivor && stamp < next_scheduled) {
+                    Posix.sleep (5);
+                    continue;
+                }
+            }
+
+            var why = by_launch ? "launch" : "interval";
+            armed = 0;
+            first_pass = false;
 
             /* Start from what is already known, so a page seen before keeps its
              * count and its history rather than looking new every time. */
@@ -865,14 +967,14 @@ int main (string[] args) {
             profile.prune (stamp - retention);
             write_profile (auto_path, profile);
 
-            stdout.printf ("%u processes: %u pages in %u files, %" + uint64.FORMAT
+            stdout.printf ("%s: %u processes, %u pages in %u files, %" + uint64.FORMAT
                            + " MiB (%+d pages)\n",
-                           sampled, profile.page_count (), profile.order.length,
+                           why, sampled, profile.page_count (), profile.order.length,
                            profile.total_bytes () / (1024 * 1024),
                            (int) profile.page_count () - (int) known);
             stdout.flush ();
 
-            Posix.sleep (interval);
+            next_scheduled = new DateTime.now_utc ().to_unix () + interval;
         }
 
     case "warm":

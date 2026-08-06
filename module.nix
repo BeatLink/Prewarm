@@ -233,6 +233,34 @@ in
                 '';
             };
 
+            settle = lib.mkOption {
+                type = lib.types.int;
+                default = 20;
+                description = ''
+                    Seconds to wait after a new process appears before sampling.
+
+                    A launch is when a profile is most wrong and most worth
+                    fixing, so watch reacts to one rather than waiting for the
+                    next interval -- but sampling immediately would catch a
+                    process that has not finished mapping its libraries or
+                    drawing its window.
+
+                    Only processes still alive after this long count. Most new
+                    processes on a busy system are short-lived helpers, and
+                    sampling for those would turn minGap into the sampling rate.
+                '';
+            };
+
+            minGap = lib.mkOption {
+                type = lib.types.int;
+                default = 60;
+                description = ''
+                    Floor on how often a sample may be taken, however many
+                    launches occur. Stops a build or a shell loop turning this
+                    into a busy loop.
+                '';
+            };
+
             retention = lib.mkOption {
                 type = lib.types.int;
                 default = 86400;
@@ -288,6 +316,8 @@ in
             environment = environment // {
                 PREWARM_WATCH_INTERVAL = toString cfg.watch.interval;
                 PREWARM_WATCH_RETENTION = toString cfg.watch.retention;
+                PREWARM_WATCH_SETTLE = toString cfg.watch.settle;
+                PREWARM_WATCH_MIN_GAP = toString cfg.watch.minGap;
             };
             serviceConfig = {
                 Type = "simple";
