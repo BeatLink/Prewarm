@@ -13,9 +13,10 @@
  * small fraction of the file. Measured on a PinePhone, six large libraries
  * were 449 MiB of file against 58 MiB touched.
  *
- * A profile is a set of files, each with the regions of it that matter, and
- * everything here works on that shape: one path, an array of regions, and one
- * file descriptor opened per file no matter how many regions it has.
+ * A profile is a set of files, each carrying the pages of it that matter, when
+ * each was last seen, and how often. Held in memory as one path with a sorted
+ * array of pages; written to disk as one path with its runs of pages, so a
+ * path appears once however many regions it has.
  */
 
 using GLib;
@@ -43,95 +44,201 @@ extern int mincore (void *addr, size_t length, uint8 *vec);
 const uint64 PAGEMAP_PRESENT = 1UL << 63;
 const uint64 PAGEMAP_SWAPPED = 1UL << 62;
 
-struct Region {
-    public uint64 off;
-    public uint64 len;
+long page_size;
+
+/* One page of one file, and what is known about it. Kept per page rather than
+ * per region because that is the granularity the counts mean anything at: two
+ * samples rarely fault exactly the same span, and splitting regions to fit
+ * would lose the counts at every boundary. Runs are recovered on the way out. */
+struct Page {
+    public uint64 index;
+    public uint32 hits;
+    public int64  seen;
 }
 
-/* Insertion-ordered so a profile written back out keeps the shape it was read
- * in, which makes the files diffable between runs. */
+/* A run of consecutive pages agreeing on hits and last-seen, which is what a
+ * profile line holds and what warm and lock operate on. */
+struct Run {
+    public uint64 off;
+    public uint64 len;
+    public uint32 hits;
+    public int64  seen;
+}
+
 class Profile : Object {
     public GenericArray<string> order = new GenericArray<string> ();
-    public HashTable<string, GenericArray<Region?>> files =
-        new HashTable<string, GenericArray<Region?>> (str_hash, str_equal);
+    public HashTable<string, GenericArray<Page?>> files =
+        new HashTable<string, GenericArray<Page?>> (str_hash, str_equal);
 
-    public GenericArray<Region?> regions_for (string path) {
+    public GenericArray<Page?> pages_for (string path) {
         var existing = files.lookup (path);
         if (existing != null) {
             return existing;
         }
 
-        var fresh = new GenericArray<Region?> ();
+        var fresh = new GenericArray<Page?> ();
         files.insert (path, fresh);
         order.add (path);
         return fresh;
     }
 
-    public void add (string path, uint64 off, uint64 len) {
-        if (len != 0) {
-            regions_for (path).add (Region () { off = off, len = len });
+    public void add_run (string path, uint64 off, uint64 len, uint32 hits, int64 seen) {
+        if (len == 0) {
+            return;
         }
+
+        var pages = pages_for (path);
+        var first = off / page_size;
+        var count = (len + page_size - 1) / page_size;
+
+        for (uint64 i = 0; i < count; i++) {
+            pages.add (Page () { index = first + i, hits = hits, seen = seen });
+        }
+    }
+
+    /* Sort by page and fold duplicates, adding their hits and keeping the most
+     * recent sighting. This is what turns "seen again" into a count: a sample
+     * contributes its pages, and the pages already present absorb them. */
+    public void consolidate () {
+        foreach (var path in order) {
+            var pages = files.lookup (path);
+
+            pages.sort ((a, b) => {
+                if (a.index < b.index) return -1;
+                if (a.index > b.index) return 1;
+                return 0;
+            });
+
+            var folded = new GenericArray<Page?> ();
+            for (int i = 0; i < pages.length; i++) {
+                var cur = pages[i];
+
+                while (i + 1 < pages.length && pages[i + 1].index == cur.index) {
+                    var hits = (uint64) cur.hits + pages[i + 1].hits;
+                    cur.hits = (uint32) uint64.min (hits, uint32.MAX);
+                    if (pages[i + 1].seen > cur.seen) {
+                        cur.seen = pages[i + 1].seen;
+                    }
+                    i++;
+                }
+
+                folded.add (cur);
+            }
+
+            files.replace (path, folded);
+        }
+    }
+
+    /* Anything not seen since `cutoff` is dropped, and a file with nothing left
+     * goes with it. This is the whole of the ageing policy -- there are no
+     * generations to rotate, just a last-seen stamp per page. */
+    public void prune (int64 cutoff) {
+        var kept_order = new GenericArray<string> ();
+
+        foreach (var path in order) {
+            var pages = files.lookup (path);
+            var kept = new GenericArray<Page?> ();
+
+            foreach (var p in pages) {
+                if (p.seen >= cutoff) {
+                    kept.add (p);
+                }
+            }
+
+            if (kept.length == 0) {
+                files.remove (path);
+                continue;
+            }
+
+            files.replace (path, kept);
+            kept_order.add (path);
+        }
+
+        order = kept_order;
+    }
+
+    /* Consecutive pages agreeing on hits and last-seen collapse into one run,
+     * which is what gets written and what warm and lock iterate. */
+    public GenericArray<Run?> runs_for (string path) {
+        var runs = new GenericArray<Run?> ();
+        var pages = files.lookup (path);
+
+        for (int i = 0; i < pages.length; i++) {
+            var first = pages[i];
+            uint64 count = 1;
+
+            while (i + 1 < pages.length
+                   && pages[i + 1].index == first.index + count
+                   && pages[i + 1].hits == first.hits
+                   && pages[i + 1].seen == first.seen) {
+                count++;
+                i++;
+            }
+
+            runs.add (Run () {
+                off = first.index * page_size,
+                len = count * page_size,
+                hits = first.hits,
+                seen = first.seen
+            });
+        }
+
+        return runs;
     }
 
     public uint64 total_bytes () {
         uint64 total = 0;
         foreach (var path in order) {
-            foreach (var r in files.lookup (path)) {
-                total += r.len;
-            }
+            total += (uint64) files.lookup (path).length * page_size;
         }
         return total;
     }
 
-    public uint region_count () {
+    public uint page_count () {
         uint n = 0;
         foreach (var path in order) {
             n += files.lookup (path).length;
         }
         return n;
     }
-
-    /* Sort each file's regions and fold overlapping and adjacent ones together,
-     * so a page covered by several profiles is stored, warmed and locked once.
-     * Per file rather than globally: nothing ever needs to compare regions of
-     * different files, and this way the sort is over a handful of entries
-     * rather than every entry in the system. */
-    public void merge () {
-        foreach (var path in order) {
-            var regions = files.lookup (path);
-
-            regions.sort ((a, b) => {
-                if (a.off < b.off) return -1;
-                if (a.off > b.off) return 1;
-                return 0;
-            });
-
-            var merged = new GenericArray<Region?> ();
-            for (int i = 0; i < regions.length; i++) {
-                var off = regions[i].off;
-                var end = off + regions[i].len;
-
-                while (i + 1 < regions.length && regions[i + 1].off <= end) {
-                    var next_end = regions[i + 1].off + regions[i + 1].len;
-                    if (next_end > end) {
-                        end = next_end;
-                    }
-                    i++;
-                }
-
-                merged.add (Region () { off = off, len = end - off });
-            }
-
-            files.replace (path, merged);
-        }
-    }
 }
-
-long page_size;
 
 /* ---------------------------------------------------------------- recording */
 
-void record_pid (Profile profile, string pid, uint64 min_size, string? prefix) {
+/* Split on runs of spaces, stopping after `limit` fields so the last one keeps
+ * whatever is left -- which for a maps line is the path, spaces and all. */
+string[] split_fields (string line, int limit) {
+    var fields = new GenericArray<string> ();
+    int i = 0;
+    var len = line.length;
+
+    while (i < len && fields.length < limit - 1) {
+        while (i < len && line[i] == ' ') {
+            i++;
+        }
+
+        var start = i;
+        while (i < len && line[i] != ' ') {
+            i++;
+        }
+
+        if (i > start) {
+            fields.add (line.slice (start, i));
+        }
+    }
+
+    while (i < len && line[i] == ' ') {
+        i++;
+    }
+
+    if (i < len) {
+        fields.add (line.substring (i).chomp ());
+    }
+
+    return fields.data;
+}
+
+void record_pid (Profile profile, string pid, uint64 min_size, string? prefix, int64 now) {
     var maps_path = "/proc/%s/maps".printf (pid);
     var pagemap_path = "/proc/%s/pagemap".printf (pid);
 
@@ -147,8 +254,13 @@ void record_pid (Profile profile, string pid, uint64 min_size, string? prefix) {
 
     string line;
     while ((line = maps.read_line ()) != null) {
-        /* address perms offset dev inode path */
-        var parts = Regex.split_simple ("\\s+", line.strip ());
+        /* address perms offset dev inode path
+         *
+         * Split by hand rather than with a regex. A sample reads the maps of
+         * every process on the system, so this runs tens of thousands of times
+         * per pass, and Regex.split_simple was the only part of sampling that
+         * was not a syscall. */
+        var parts = split_fields (line, 6);
         if (parts.length < 6) {
             continue;
         }
@@ -168,9 +280,6 @@ void record_pid (Profile profile, string pid, uint64 min_size, string? prefix) {
         }
 
         var path = parts[5];
-        for (int i = 6; i < parts.length; i++) {
-            path += " " + parts[i];
-        }
 
         if (!path.has_prefix ("/") || path.contains ("(deleted)")) {
             continue;
@@ -188,7 +297,6 @@ void record_pid (Profile profile, string pid, uint64 min_size, string? prefix) {
         }
 
         var npages = (end - start) / page_size;
-        uint64 run_off = 0, run_len = 0;
         var chunk = new uint64[1024];
 
         for (uint64 i = 0; i < npages; ) {
@@ -207,78 +315,70 @@ void record_pid (Profile profile, string pid, uint64 min_size, string? prefix) {
                 }
 
                 var foff = pgoff + (i + k) * page_size;
-                if (run_len != 0 && run_off + run_len == foff) {
-                    run_len += page_size;
-                } else {
-                    add_clamped (profile, path, run_off, run_len, st.st_size);
-                    run_off = foff;
-                    run_len = page_size;
+                if (foff < (uint64) st.st_size) {
+                    profile.add_run (path, foff, page_size, 1, now);
                 }
             }
 
             i += have;
         }
-
-        add_clamped (profile, path, run_off, run_len, st.st_size);
     }
 
     Posix.close (pagemap);
 }
 
-void add_clamped (Profile profile, string path, uint64 off, uint64 len, uint64 fsize) {
-    if (len == 0 || off >= fsize) {
-        return;
-    }
-
-    profile.add (path, off, (off + len > fsize) ? fsize - off : len);
-}
-
 /* ----------------------------------------------------------------- profiles */
 
-/* On disk a profile is a path followed by its regions, one per line and
- * indented, so a path appears once however many regions it has:
+/* On disk a profile is a path followed by its runs, indented, so a path appears
+ * once however many runs it has:
  *
- *     /nix/store/…/libwebkitgtk-6.0.so.4
- *     <TAB>4096<TAB>81920
- *     <TAB>102400<TAB>8192
- *     /nix/store/…/libgtk-4.so.1
- *     <TAB>0<TAB>2306048
+ *     /usr/lib/libwebkitgtk-6.0.so.4
+ *     <TAB>offset<TAB>length<TAB>hits<TAB>last-seen
  *
- * A path on its own, with no indented lines under it, means the whole file --
- * which is how a profile can be declared by hand rather than recorded. That
- * form survives what recording cannot: a recorded profile names exact store
- * paths and is invalidated by the next update, whereas a list generated from
- * the expression that builds the system is rewritten along with it.
+ * hits is how many samples have found the pages of that run mapped, and
+ * last-seen is when the most recent of those was, as a unix time. Together they
+ * are what lets a profile age -- pages stop being refreshed and eventually fall
+ * past the retention window -- and what lets the lock budget spend itself on
+ * the most used pages rather than on whichever happened to sort first.
  *
- * The flat `path<TAB>off<TAB>len` form older versions wrote is still read.
+ * A path alone, with nothing indented under it, means the whole file, which is
+ * how a profile can be declared by hand rather than recorded.
+ *
+ * Older forms are still read: runs of `offset<TAB>length` without the counts,
+ * and flat `path<TAB>offset<TAB>length` lines.
  */
 string profile_to_string (Profile profile) {
     var buf = new StringBuilder ();
 
     foreach (var path in profile.order) {
-        var regions = profile.files.lookup (path);
-        if (regions.length == 0) {
+        var runs = profile.runs_for (path);
+        if (runs.length == 0) {
             continue;
         }
 
         buf.append (path);
         buf.append_c ('\n');
 
-        foreach (var r in regions) {
-            buf.append_printf ("\t%" + uint64.FORMAT + "\t%" + uint64.FORMAT + "\n", r.off, r.len);
+        foreach (var r in runs) {
+            buf.append_printf ("\t%" + uint64.FORMAT + "\t%" + uint64.FORMAT + "\t%u\t%" + int64.FORMAT + "\n",
+                               r.off, r.len, r.hits, r.seen);
         }
     }
 
     return buf.str;
 }
 
-Profile read_profiles (string[] paths) {
+Profile read_profiles (string[] paths, int64 now) {
     var profile = new Profile ();
 
     foreach (var p in paths) {
         FileStream f = FileStream.open (p, "r");
         if (f == null) {
-            printerr ("prewarm: %s: %s\n", p, Posix.strerror (Posix.errno));
+            /* Not yet written is the normal state on a first run, and not
+             * worth a line of output every time. */
+            if (Posix.errno != Posix.ENOENT) {
+                printerr ("prewarm: %s: %s\n", p, Posix.strerror (Posix.errno));
+            }
             continue;
         }
 
@@ -297,22 +397,36 @@ Profile read_profiles (string[] paths) {
                 }
 
                 var parts = line.substring (1).split ("\t");
-                if (parts.length != 2) {
+                if (parts.length < 2) {
                     continue;
                 }
 
-                uint64 off, len;
+                uint64 off = 0, len = 0;
                 if (!uint64.try_parse (parts[0], out off)) continue;
                 if (!uint64.try_parse (parts[1], out len)) continue;
 
-                profile.add (pending, off, len);
+                uint32 hits = 1;
+                int64 seen = now;
+
+                if (parts.length >= 4) {
+                    uint64 h = 1;
+                    int64 s = now;
+                    if (uint64.try_parse (parts[2], out h)) {
+                        hits = (uint32) uint64.min (h, uint32.MAX);
+                    }
+                    if (int64.try_parse (parts[3], out s)) {
+                        seen = s;
+                    }
+                }
+
+                profile.add_run (pending, off, len, hits, seen);
                 pending_used = true;
                 continue;
             }
 
-            /* A path with no regions under it covers the whole file. */
+            /* A path with no runs under it covers the whole file. */
             if (pending != null && !pending_used) {
-                whole_file (profile, pending);
+                whole_file (profile, pending, now);
             }
 
             var parts = line.strip ().split ("\t");
@@ -320,7 +434,7 @@ Profile read_profiles (string[] paths) {
             if (parts.length == 3) {
                 uint64 off = 0, len = 0;
                 if (uint64.try_parse (parts[1], out off) && uint64.try_parse (parts[2], out len)) {
-                    profile.add (parts[0], off, len);
+                    profile.add_run (parts[0], off, len, 1, now);
                 }
                 pending = null;
                 pending_used = false;
@@ -332,20 +446,24 @@ Profile read_profiles (string[] paths) {
         }
 
         if (pending != null && !pending_used) {
-            whole_file (profile, pending);
+            whole_file (profile, pending, now);
         }
     }
 
+    profile.consolidate ();
     return profile;
 }
 
-void whole_file (Profile profile, string path) {
+/* Declared whole files are stamped with the current time every read, so a
+ * declaration never ages out. It is a statement about what matters, not an
+ * observation that might stop being true. */
+void whole_file (Profile profile, string path, int64 now) {
     Posix.Stat st;
     if (Posix.stat (path, out st) != 0 || !Posix.S_ISREG (st.st_mode) || st.st_size == 0) {
         return;
     }
 
-    profile.add (path, 0, st.st_size);
+    profile.add_run (path, 0, st.st_size, 1, now);
 }
 
 /* --------------------------------------------------------------- warm / lock */
@@ -409,7 +527,7 @@ uint64 warm_profile (Profile profile) {
             continue;
         }
 
-        foreach (var r in profile.files.lookup (path)) {
+        foreach (var r in profile.runs_for (path)) {
             total += map_region (fd, r.off, r.len);
         }
 
@@ -458,50 +576,86 @@ uint64 warm_dir (string dir) {
     return total;
 }
 
+struct Candidate {
+    public string path;
+    public uint64 off;
+    public uint64 len;
+    public uint32 hits;
+}
+
 int lock_profile (Profile profile, uint64 max_total) {
-    uint64 locked = 0, skipped = 0;
-    uint mapped = 0, failed = 0;
+    var candidates = new GenericArray<Candidate?> ();
 
     foreach (var path in profile.order) {
-        int fd = Posix.open (path, Posix.O_RDONLY);
+        foreach (var r in profile.runs_for (path)) {
+            candidates.add (Candidate () { path = path, off = r.off, len = r.len, hits = r.hits });
+        }
+    }
+
+    /* Most used first, so a budget too small for everything spends itself on
+     * the pages most likely to be wanted. Sorting by path instead -- which is
+     * what happens without the counts -- drops whatever sorts last, which has
+     * nothing to do with how useful it is. */
+    candidates.sort ((a, b) => {
+        if (a.hits != b.hits) {
+            return (b.hits > a.hits) ? 1 : -1;
+        }
+        return strcmp (a.path, b.path);
+    });
+
+    uint64 locked = 0, skipped = 0;
+    uint mapped = 0, failed = 0;
+    string? open_path = null;
+    int fd = -1;
+
+    foreach (var c in candidates) {
+        if (max_total != 0 && locked + c.len > max_total) {
+            skipped += c.len;
+            continue;
+        }
+
+        if (open_path != c.path) {
+            if (fd >= 0) {
+                Posix.close (fd);
+            }
+            fd = Posix.open (c.path, Posix.O_RDONLY);
+            open_path = c.path;
+        }
+
         if (fd < 0) {
             failed++;
             continue;
         }
 
-        foreach (var r in profile.files.lookup (path)) {
-            if (max_total != 0 && locked + r.len > max_total) {
-                skipped += r.len;
-                continue;
-            }
-
-            var addr = mmap (null, (size_t) r.len, MMAP_PROT_READ, MMAP_MAP_SHARED,
-                             fd, (Posix.off_t) r.off);
-            if ((long) addr == -1) {
-                failed++;
-                continue;
-            }
-
-            if (mlock (addr, (size_t) r.len) != 0) {
-                printerr ("prewarm: mlock %s: %s\n", path, Posix.strerror (Posix.errno));
-                munmap (addr, (size_t) r.len);
-                failed++;
-                continue;
-            }
-
-            locked += r.len;
-            mapped++;
+        var addr = mmap (null, (size_t) c.len, MMAP_PROT_READ, MMAP_MAP_SHARED,
+                         fd, (Posix.off_t) c.off);
+        if ((long) addr == -1) {
+            failed++;
+            continue;
         }
 
-        /* The mappings outlive the descriptor, and are deliberately never
-         * unmapped -- the lock lasts exactly as long as this process. */
+        if (mlock (addr, (size_t) c.len) != 0) {
+            printerr ("prewarm: mlock %s: %s\n", c.path, Posix.strerror (Posix.errno));
+            munmap (addr, (size_t) c.len);
+            failed++;
+            continue;
+        }
+
+        locked += c.len;
+        mapped++;
+    }
+
+    if (fd >= 0) {
         Posix.close (fd);
     }
 
+    /* The mappings are deliberately never unmapped -- the lock lasts exactly as
+     * long as this process, which is why it runs as a service that does nothing
+     * else. */
     stdout.printf ("locked %" + uint64.FORMAT + " KiB across %u regions in %u files",
                    locked / 1024, mapped, profile.order.length);
     if (skipped != 0) {
-        stdout.printf (", skipped %" + uint64.FORMAT + " KiB over the budget", skipped / 1024);
+        stdout.printf (", skipped %" + uint64.FORMAT + " KiB least used", skipped / 1024);
     }
     if (failed != 0) {
         stdout.printf (", %u failed", failed);
@@ -558,7 +712,7 @@ void write_profile (string path, Profile profile) {
 
 void usage () {
     printerr ("""usage: prewarm record <name> <pid>...  record the pages those processes touched
-       prewarm watch                   keep recording every running process
+       prewarm watch                   keep recording, ageing out what stops being used
        prewarm warm                    read the recorded regions and dirs back in
        prewarm lock                    mlock the recorded regions, then hold them
        prewarm status                  report what is covered
@@ -572,12 +726,15 @@ environment:
   PREWARM_MAX_LOCKED      ceiling on locked bytes, 0 for no limit
   PREWARM_WARM_DIRS       :-separated directories to warm whole
   PREWARM_WATCH_INTERVAL  seconds between samples (default 300)
-  PREWARM_WATCH_GENERATIONS  samples kept before one ages out (default 6)
+  PREWARM_WATCH_RETENTION seconds a page is kept after it was last seen
+                          (default 86400)
 """);
 }
 
 int main (string[] args) {
     page_size = Posix.sysconf (Posix._SC_PAGESIZE);
+
+    var now = new DateTime.now_utc ().to_unix ();
 
     var state_dir = Environment.get_variable ("PREWARM_STATE_DIR") ?? "/var/lib/prewarm";
     var profile_dirs = Environment.get_variable ("PREWARM_PROFILE_DIRS") ?? state_dir;
@@ -611,9 +768,9 @@ int main (string[] args) {
 
         var profile = new Profile ();
         for (int i = 3; i < args.length; i++) {
-            record_pid (profile, args[i], min_size, prefix);
+            record_pid (profile, args[i], min_size, prefix, now);
         }
-        profile.merge ();
+        profile.consolidate ();
 
         if (DirUtils.create_with_parents (state_dir, 0775) != 0) {
             printerr ("prewarm: cannot create %s: %s\n", state_dir, Posix.strerror (Posix.errno));
@@ -622,8 +779,8 @@ int main (string[] args) {
 
         write_profile (Path.build_filename (state_dir, args[2] + ".pages"), profile);
 
-        stdout.printf ("%s: %u regions in %u files, %" + uint64.FORMAT + " MiB\n",
-                       args[2], profile.region_count (), profile.order.length,
+        stdout.printf ("%s: %u pages in %u files, %" + uint64.FORMAT + " MiB\n",
+                       args[2], profile.page_count (), profile.order.length,
                        profile.total_bytes () / (1024 * 1024));
         return 0;
 
@@ -637,28 +794,17 @@ int main (string[] args) {
             interval = 10;
         }
 
-        var generations = 6;
-        var gens_raw = Environment.get_variable ("PREWARM_WATCH_GENERATIONS");
-        if (gens_raw != null) {
-            generations = int.parse (gens_raw);
+        /* How long a page is kept after the last sample that saw it. This is
+         * the only ageing knob, and it is independent of how often samples are
+         * taken -- sampling often to catch short-lived processes should not
+         * mean forgetting a library nothing has touched for an hour. */
+        int64 retention = 86400;
+        var ret_raw = Environment.get_variable ("PREWARM_WATCH_RETENTION");
+        if (ret_raw != null) {
+            retention = int64.parse (ret_raw);
         }
-        if (generations < 1) {
-            generations = 1;
-        }
-
-        /* How many samples accumulate into a generation before moving on to the
-         * next. Without this, retention and sampling frequency are the same
-         * knob: sampling often enough to catch a short-lived process would also
-         * mean forgetting everything within the hour, which is the opposite of
-         * what a preloader is for. Retention is
-         * generations * rotate * interval -- by default six hours. */
-        var rotate = 12;
-        var rotate_raw = Environment.get_variable ("PREWARM_WATCH_ROTATE");
-        if (rotate_raw != null) {
-            rotate = int.parse (rotate_raw);
-        }
-        if (rotate < 1) {
-            rotate = 1;
+        if (retention < interval) {
+            retention = interval;
         }
 
         if (DirUtils.create_with_parents (state_dir, 0775) != 0) {
@@ -666,13 +812,19 @@ int main (string[] args) {
             return 1;
         }
 
-        stdout.printf ("watching every %ds, %d generations of %d samples -- %d minutes of history\n",
-                       interval, generations, rotate,
-                       (interval * rotate * generations) / 60);
+        var auto_path = Path.build_filename (state_dir, "auto.pages");
+
+        stdout.printf ("watching every %ds, keeping pages for %" + int64.FORMAT + "h\n",
+                       interval, retention / 3600);
         stdout.flush ();
 
-        for (int cycle = 0; ; cycle++) {
-            var sample = new Profile ();
+        while (true) {
+            var stamp = new DateTime.now_utc ().to_unix ();
+
+            /* Start from what is already known, so a page seen before keeps its
+             * count and its history rather than looking new every time. */
+            var profile = read_profiles ({ auto_path }, stamp);
+            var known = profile.page_count ();
             uint sampled = 0;
 
             try {
@@ -702,53 +854,29 @@ int main (string[] args) {
                         continue;
                     }
 
-                    record_pid (sample, entry, min_size, prefix);
+                    record_pid (profile, entry, min_size, prefix, stamp);
                     sampled++;
                 }
             } catch (FileError e) {
                 printerr ("prewarm: /proc: %s\n", e.message);
             }
 
-            /* Generations rather than one file that only ever grows. warm and
-             * lock merge every profile in the directory, so the union of the
-             * generations is what gets used, and a generation that stops being
-             * added to falls out once it is overwritten. Decay with no
-             * bookkeeping -- and it is also what makes this survive an update,
-             * since paths that no longer exist stop appearing in samples.
-             *
-             * Each sample is folded into the current generation rather than
-             * replacing it, so a page seen once is remembered for the whole
-             * retention window and not just until the next sample. */
-            var generation = (cycle / rotate) % generations;
-            var path = Path.build_filename (state_dir, "auto-%d.pages".printf (generation));
-            var opening = (cycle % rotate) == 0;
+            profile.consolidate ();
+            profile.prune (stamp - retention);
+            write_profile (auto_path, profile);
 
-            if (!opening) {
-                var carried = read_profiles ({ path });
-                foreach (var existing in carried.order) {
-                    foreach (var r in carried.files.lookup (existing)) {
-                        sample.add (existing, r.off, r.len);
-                    }
-                }
-            }
-
-            sample.merge ();
-            write_profile (path, sample);
-
-            stdout.printf ("generation %d%s: %u processes, %u regions in %u files, %"
-                           + uint64.FORMAT + " MiB\n",
-                           generation, opening ? " (fresh)" : "", sampled,
-                           sample.region_count (), sample.order.length,
-                           sample.total_bytes () / (1024 * 1024));
+            stdout.printf ("%u processes: %u pages in %u files, %" + uint64.FORMAT
+                           + " MiB (%+d pages)\n",
+                           sampled, profile.page_count (), profile.order.length,
+                           profile.total_bytes () / (1024 * 1024),
+                           (int) profile.page_count () - (int) known);
             stdout.flush ();
 
             Posix.sleep (interval);
         }
 
     case "warm":
-        var profile = read_profiles (profiles_in (profile_dirs + ":" + warm_only_dirs));
-        profile.merge ();
-
+        var profile = read_profiles (profiles_in (profile_dirs + ":" + warm_only_dirs), now);
         var bytes = warm_profile (profile);
         stdout.printf ("warmed %" + uint64.FORMAT + " MiB of recorded regions\n",
                        bytes / (1024 * 1024));
@@ -769,9 +897,7 @@ int main (string[] args) {
             uint64.try_parse (max_raw, out max_total);
         }
 
-        var to_lock = read_profiles (profiles_in (profile_dirs));
-        to_lock.merge ();
-
+        var to_lock = read_profiles (profiles_in (profile_dirs), now);
         if (to_lock.order.length == 0) {
             printerr ("prewarm: nothing recorded to lock\n");
             return 0;
@@ -786,24 +912,33 @@ int main (string[] args) {
             locked_set.add (lp);
         }
 
-        stdout.printf ("%-16s %8s %8s %10s  %s\n", "profile", "files", "regions", "size", "held");
+        stdout.printf ("%-14s %7s %8s %9s %7s  %s\n",
+                       "profile", "files", "pages", "size", "hits", "held");
 
         foreach (var p in profiles) {
-            var one = read_profiles ({ p });
-            one.merge ();
+            var one = read_profiles ({ p }, now);
 
-            stdout.printf ("%-16s %8u %8u %9" + uint64.FORMAT + "M  %s\n",
+            uint64 hits = 0;
+            uint pages = 0;
+            foreach (var path in one.order) {
+                foreach (var pg in one.files.lookup (path)) {
+                    hits += pg.hits;
+                    pages++;
+                }
+            }
+
+            stdout.printf ("%-14s %7u %8u %8" + uint64.FORMAT + "M %7.1f  %s\n",
                            Path.get_basename (p).replace (".pages", "").replace (".files", ""),
-                           one.order.length, one.region_count (),
+                           one.order.length, one.page_count (),
                            one.total_bytes () / (1024 * 1024),
+                           pages > 0 ? (double) hits / pages : 0.0,
                            locked_set.contains (p) ? "warm+lock" : "warm");
         }
 
-        var all = read_profiles (profiles);
-        all.merge ();
-        stdout.printf ("%-16s %8u %8u %9" + uint64.FORMAT + "M  (shared pages counted once)\n",
-                       "= merged", all.order.length, all.region_count (),
-                       all.total_bytes () / (1024 * 1024));
+        var all = read_profiles (profiles, now);
+        stdout.printf ("%-14s %7u %8u %8" + uint64.FORMAT + "M %7s  (shared pages counted once)\n",
+                       "= merged", all.order.length, all.page_count (),
+                       all.total_bytes () / (1024 * 1024), "");
         return 0;
 
     default:

@@ -233,30 +233,23 @@ in
                 '';
             };
 
-            rotate = lib.mkOption {
+            retention = lib.mkOption {
                 type = lib.types.int;
-                default = 12;
+                default = 86400;
                 description = ''
-                    How many samples accumulate into a generation before moving
-                    on to the next.
+                    Seconds a page is kept after the last sample that saw it.
 
-                    This is what separates how often it looks from how long it
-                    remembers. Sampling often enough to catch a short-lived
-                    process should not also mean forgetting a library because
-                    nothing touched it for half an hour.
-                '';
-            };
+                    Independent of the sampling interval, deliberately: sampling
+                    often enough to catch a short-lived process should not also
+                    mean forgetting a library because nothing touched it for
+                    half an hour. A preloader whose memory is shorter than a
+                    session defeats itself.
 
-            generations = lib.mkOption {
-                type = lib.types.int;
-                default = 6;
-                description = ''
-                    How many generations are kept. The oldest is overwritten
-                    when a new one opens, and the union of all of them is what
-                    gets warmed.
-
-                    Total retention is interval * rotate * generations. At the
-                    defaults, six hours, dropping the oldest hour at a time.
+                    Every page carries its own last-seen stamp and a count of
+                    how many samples have found it, so what falls out is what
+                    genuinely stopped being used -- and the lock budget, when it
+                    cannot fit everything, spends itself on the most used pages
+                    rather than on whichever sorted first.
                 '';
             };
         };
@@ -294,8 +287,7 @@ in
             wantedBy = [ "multi-user.target" ];
             environment = environment // {
                 PREWARM_WATCH_INTERVAL = toString cfg.watch.interval;
-                PREWARM_WATCH_GENERATIONS = toString cfg.watch.generations;
-                PREWARM_WATCH_ROTATE = toString cfg.watch.rotate;
+                PREWARM_WATCH_RETENTION = toString cfg.watch.retention;
             };
             serviceConfig = {
                 Type = "simple";
