@@ -33,9 +33,6 @@ extern const int MMAP_PROT_READ;
 [CCode (cname = "MAP_SHARED", cheader_filename = "sys/mman.h")]
 extern const int MMAP_MAP_SHARED;
 
-[CCode (cname = "MAP_POPULATE", cheader_filename = "sys/mman.h")]
-extern const int MMAP_MAP_POPULATE;
-
 /* vec as a pointer, not uint8[]: Vala passes an implicit length alongside an
  * array parameter, which gives mincore a fourth argument it does not have. */
 [CCode (cheader_filename = "sys/mman.h")]
@@ -51,6 +48,10 @@ struct Range {
 }
 
 long page_size;
+
+/* Accumulates the bytes read while touching, so the loop cannot be optimised
+ * away as having no effect. */
+uint8 touch_sink;
 
 /* ---------------------------------------------------------------- recording */
 
@@ -263,7 +264,7 @@ Array<Range?> merge (Array<Range?> input) {
 
 /* --------------------------------------------------------------- warm / lock */
 
-/* mmap with MAP_POPULATE, and then check with mincore.
+/* mmap, touch every page, and then check with mincore.
  *
  * The two obvious cheaper approaches both fail on ZFS, and fail quietly, which
  * is the dangerous part. Measured against a 5504-file profile on an SD card,
@@ -276,19 +277,29 @@ Array<Range?> merge (Array<Range?> input) {
  *   mmap and touch each page  83.5s    98% resident   -- works
  *
  * Only mmap creates page cache pages on ZFS; reads go to the ARC instead, so on
- * a dataset that caches metadata only they leave nothing behind. MAP_POPULATE
- * asks the kernel to prefault the whole mapping, which is the same mechanism
- * vmtouch drives one page at a time from userspace.
+ * a dataset that caches metadata only they leave nothing behind. Reading the
+ * mapping sequentially is also what engages the kernel readahead that makes it
+ * bearable -- MAP_POPULATE, which prefaults without that, took 457.5s.
  *
  * Returns bytes mincore reports as actually resident, never bytes requested, so
  * a filesystem that ignores all of this cannot report success.
  */
 uint64 map_range (int fd, uint64 off, uint64 len) {
     var addr = mmap (null, (size_t) len, MMAP_PROT_READ,
-                     MMAP_MAP_SHARED | MMAP_MAP_POPULATE, fd, (Posix.off_t) off);
+                     MMAP_MAP_SHARED, fd, (Posix.off_t) off);
 
     if ((long) addr == -1) {
         return 0;
+    }
+
+    /* Touched a page at a time from here rather than handed to MAP_POPULATE.
+     * Reading the mapping sequentially is what trips the kernel's readahead
+     * heuristic, and that batching is worth more than prefaulting in one call:
+     * MAP_POPULATE over the same 5504-file profile took 457.5s to this loop's
+     * 83.5s, for 100% residency against 98%. */
+    uint8 *bytes = (uint8 *) addr;
+    for (uint64 i = 0; i < len; i += page_size) {
+        touch_sink |= bytes[i];
     }
 
     var pages = (len + page_size - 1) / page_size;
@@ -475,7 +486,8 @@ void usage () {
        prewarm status                   report what is recorded and resident
 
 environment:
-  PREWARM_STATE_DIR    where `record` writes profiles (default /var/lib/prewarm)\n  PREWARM_PROFILE_DIRS :-separated dirs to read profiles from (default state dir)
+  PREWARM_STATE_DIR    where `record` writes profiles (default /var/lib/prewarm)\n  PREWARM_PROFILE_DIRS :-separated dirs of profiles to warm and lock
+  PREWARM_WARM_ONLY_DIRS :-separated dirs of profiles to warm but never lock
   PREWARM_MIN_SIZE     smallest file to record ranges for, bytes (default 0)
   PREWARM_PREFIX       only record paths under this prefix
   PREWARM_MAX_LOCKED   ceiling on locked bytes, 0 for no limit
@@ -489,6 +501,12 @@ int main (string[] args) {
 
     var state_dir = Environment.get_variable ("PREWARM_STATE_DIR") ?? "/var/lib/prewarm";
     var profile_dirs = Environment.get_variable ("PREWARM_PROFILE_DIRS") ?? state_dir;
+
+    /* Profiles worth reading in but not worth pinning. Whole shared libraries
+     * belong here: warming them costs I/O once and covers every page an app
+     * might reach, where locking them would charge RAM for the large fraction
+     * no app ever executes. */
+    var warm_only_dirs = Environment.get_variable ("PREWARM_WARM_ONLY_DIRS") ?? "";
     var warm_dirs_raw = Environment.get_variable ("PREWARM_WARM_DIRS") ?? "";
 
     if (args.length < 2) {
@@ -540,7 +558,7 @@ int main (string[] args) {
         return 0;
 
     case "warm":
-        var ranges = merge (read_profiles (profiles_in (profile_dirs)));
+        var ranges = merge (read_profiles (profiles_in (profile_dirs + ":" + warm_only_dirs)));
         var bytes = warm_ranges (ranges);
         stdout.printf ("warmed %" + uint64.FORMAT + " MiB of recorded pages\n",
                        bytes / (1024 * 1024));
@@ -571,8 +589,12 @@ int main (string[] args) {
         return lock_ranges (to_lock, max_total);
 
     case "status":
-        var profiles = profiles_in (profile_dirs);
-        stdout.printf ("%-16s %8s %10s\n", "profile", "ranges", "size");
+        var profiles = profiles_in (profile_dirs + ":" + warm_only_dirs);
+        var locked_set = new GenericSet<string> (str_hash, str_equal);
+        foreach (var lp in profiles_in (profile_dirs)) {
+            locked_set.add (lp);
+        }
+        stdout.printf ("%-16s %8s %10s  %s\n", "profile", "ranges", "size", "held");
 
         foreach (var p in profiles) {
             var one = merge (read_profiles ({ p }));
@@ -580,9 +602,10 @@ int main (string[] args) {
             for (uint i = 0; i < one.length; i++) {
                 bytes += one.index (i).len;
             }
-            stdout.printf ("%-16s %8u %9" + uint64.FORMAT + "M\n",
+            stdout.printf ("%-16s %8u %9" + uint64.FORMAT + "M  %s\n",
                            Path.get_basename (p).replace (".pages", "").replace (".files", ""),
-                           one.length, bytes / (1024 * 1024));
+                           one.length, bytes / (1024 * 1024),
+                           locked_set.contains (p) ? "warm+lock" : "warm");
         }
 
         var all = merge (read_profiles (profiles));

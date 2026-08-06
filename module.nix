@@ -19,16 +19,21 @@ self:
 let
     cfg = config.services.prewarm;
 
-    named = lib.filterAttrs (_: p: p.files != [ ]) cfg.profiles;
+    withFiles = lib.filterAttrs (_: p: p.files != [ ]) cfg.profiles;
 
     # One file per profile rather than one big list, so `prewarm status` can
     # still report them apart -- which is the point of naming them.
-    declared = pkgs.linkFarm "prewarm-profiles" (
-        lib.mapAttrsToList (name: p: {
-            name = "${name}.files";
-            path = pkgs.writeText "${name}.files" (lib.concatLines p.files);
-        }) named
-    );
+    farm =
+        which:
+        pkgs.linkFarm "prewarm-${which}-profiles" (
+            lib.mapAttrsToList (name: p: {
+                name = "${name}.files";
+                path = pkgs.writeText "${name}.files" (lib.concatLines p.files);
+            }) (lib.filterAttrs (_: p: p.lock == (which == "locked")) withFiles)
+        );
+
+    lockedNamed = lib.filterAttrs (_: p: p.lock) withFiles;
+    warmNamed = lib.filterAttrs (_: p: !p.lock) withFiles;
 
     allWarmDirs = cfg.warmDirs ++ lib.concatMap (p: p.dirs) (lib.attrValues cfg.profiles);
 
@@ -36,8 +41,9 @@ let
         {
             PREWARM_STATE_DIR = cfg.stateDir;
             PREWARM_PROFILE_DIRS = lib.concatStringsSep ":" (
-                [ cfg.stateDir ] ++ lib.optional (named != { }) "${declared}"
+                [ cfg.stateDir ] ++ lib.optional (lockedNamed != { }) "${farm "locked"}"
             );
+            PREWARM_WARM_ONLY_DIRS = lib.optionalString (warmNamed != { }) "${farm "warm"}";
             PREWARM_MIN_SIZE = toString cfg.minSize;
             PREWARM_MAX_LOCKED = toString cfg.maxLocked;
             PREWARM_WARM_DIRS = lib.concatStringsSep ":" allWarmDirs;
@@ -145,6 +151,24 @@ in
                             description = ''
                                 Directories to warm whole, walked live. Warmed
                                 only, never locked -- see warmDirs.
+                            '';
+                        };
+
+                        lock = lib.mkOption {
+                            type = lib.types.bool;
+                            default = true;
+                            description = ''
+                                Whether this profile's files are locked as well
+                                as warmed.
+
+                                Turn it off for whole shared libraries. Warming
+                                one costs I/O once and covers every page an app
+                                might reach; locking it charges RAM for the
+                                large fraction no app executes -- measured,
+                                libwebkitgtk is 132 MiB on disk against 43.7 MiB
+                                touched by a heavy session. Locking is better
+                                spent on recorded page ranges, which hold the
+                                pages that were actually used.
                             '';
                         };
                     };
