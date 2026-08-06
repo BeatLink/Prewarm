@@ -1,121 +1,108 @@
 # prewarm
 
-Keeps the pages an application needs at startup resident, so launching it does
-not wait on storage.
+Keeps the pages your applications need resident, so starting them does not wait
+on storage.
 
-Built for a PinePhone, where a cold app launch is almost entirely I/O wait, but
-nothing in it is phone-specific.
+Useful anywhere launch time is dominated by I/O rather than CPU: slow or
+contended disks, SD cards, network-backed storage, or a machine with enough RAM
+to hold a working set that keeps getting evicted anyway.
 
 ## What it does
 
-Two mechanisms, kept separate because they cost different things:
+`prewarm` learns which pages of which files your applications actually touch,
+and then keeps those pages in memory.
 
-| | how | cost | guarantee |
+It works in **regions**, not whole files. A shared library is demand-paged: a
+process maps the whole file but faults in only the parts it executes, often a
+small fraction. Reading the rest wastes I/O, and pinning it wastes RAM. So a
+profile records the pages that were really used, and everything downstream
+operates on those.
+
+Two ways to keep them:
+
+| | mechanism | costs | guarantees |
 | --- | --- | --- | --- |
-| `warm` | `mmap` + `MAP_POPULATE` | free to hold | none, pages are evictable |
-| `lock` | `mmap` + `mlock` | charged against RAM | resident until the process exits |
+| `warm` | reads pages into the page cache | I/O when it runs, nothing to hold | nothing — pages stay evictable |
+| `lock` | `mmap` + `mlock` | RAM, until the process exits | residency |
 
-Both work from the same profiles.
+Warming is nearly free and usually enough. Locking is for the set you never want
+to lose, and is bounded by a configurable ceiling.
 
-### Why mmap, and not something cheaper
+Profiles merge. A page used by several applications is stored, warmed and locked
+once — which is most of the benefit on a system where everything shares a
+toolkit.
 
-Both obvious shortcuts fail on ZFS, and fail *quietly*, which is the dangerous
-part -- they return success having done nothing. Measured against a 5504-file
-profile on an SD card, each followed by an independent residency check:
+## Getting a profile
 
-| approach | time | resident after |
-| --- | --- | --- |
-| `posix_fadvise(WILLNEED)` | 4.6s | **0%** -- ignored outright |
-| `pread` of every byte | 118.8s | **0%** -- fills the ARC, which `primarycache=metadata` discards |
-| `mmap` + touch each page | 83.5s | 98% |
+**Automatically.** `prewarm watch` samples every running process on an interval
+and writes what it finds. Nothing has to be anticipated, and it repairs itself
+when packages change, because paths that stop existing stop appearing in
+samples.
 
-Only `mmap` creates page cache pages on ZFS; reads go to the ARC instead, so on
-a dataset caching metadata only they leave nothing behind. `MAP_POPULATE` asks
-the kernel to prefault the mapping rather than driving it a page at a time from
-userspace, as `vmtouch` does.
+Samples rotate through a fixed number of generations. The union of them is the
+profile, so anything that stops being touched ages out on its own.
 
-`warm` reports bytes `mincore` confirms are resident, never bytes requested, so
-a filesystem that ignores all of this cannot report success.
+**By hand.** `prewarm record <name> <pid>...` captures one moment deliberately —
+useful for a named, per-application profile, for a specific workflow you want
+covered, or to get started without running a daemon.
 
-## Why page ranges rather than files
-
-A shared library is demand-paged. The process maps the whole file but faults in
-only the pages it executes, so warming or locking whole files pays for a great
-deal that is never read. Measured on a PinePhone with a warm Epiphany:
-
-| library | on disk | actually resident |
-| --- | --- | --- |
-| `libwebkitgtk-6.0` | 132.4 MiB | 26.8 MiB |
-| `libjavascriptcoregtk` | 37.8 MiB | 8.2 MiB |
-| `libLLVM` | 176.8 MiB | 14.0 MiB |
-| `libgallium` | 56.4 MiB | 3.7 MiB |
-| `libgtk-4` | 14.2 MiB | 5.4 MiB |
-| `libicudata` | 31.6 MiB | ~0 |
-
-449 MiB of file, 58 MiB touched. `prewarm record` reads the present bit out of
-`/proc/PID/pagemap` for every file-backed mapping, so a profile describes the
-pages that process actually faulted in.
-
-Profiles merge. Pages shared between applications are stored, warmed and locked
-once, which is most of the value on a system where everything is GTK: recording
-Epiphany gave 109 MiB, and adding Files, Secrets and Settings on top cost only
-16 MiB more, because they land on pages already covered.
-
-## Two ways to say what matters
-
-**Record it**, when you do not already know:
-
-```sh
-# Start the app, use it, then record what it touched.
-prewarm record epiphany $(pgrep 'epiphany|WebKit')
-```
-
-**Declare it**, when you do. A profile can be a plain list of paths, one per
-line, `#` for comments -- no recording step, and whole files rather than ranges:
+**By declaration.** A profile can just be a list of paths, one per line, `#` for
+comments:
 
 ```
-# /etc/prewarm/epiphany.files
-/nix/store/…-epiphany-50.4/bin/epiphany
-/nix/store/…-webkitgtk-2.52.5/lib/libwebkitgtk-6.0.so.4
+# epiphany.files
+/usr/lib/libwebkitgtk-6.0.so.4
+/usr/bin/epiphany
 ```
 
-Declaring is the better default where the answer is obvious, because it is the
-only one that survives an update: a recorded profile names exact store paths and
-is silently invalidated the next time they change, whereas a declared list
-generated from the same expression that builds the system is rewritten with it.
+Each named path is covered whole. Use this when you already know what matters,
+or when generating the list from configuration management.
 
-Recording still wins where the answer is not obvious -- it captures the pages
-actually faulted in rather than whole files. Both formats are read by the same
-parser and merged together, so a system can use each where it fits.
+All three produce files in the same directory and are read together.
 
 ## Usage
 
 ```sh
-prewarm warm      # read the profiles back into the page cache
-prewarm lock      # hold them with mlock; runs until killed
+prewarm watch     # sample running processes on an interval
+prewarm record epiphany $(pgrep 'epiphany|WebKit')
+prewarm warm      # read the profiles into the page cache
+prewarm lock      # hold them with mlock; runs until stopped
 prewarm status    # what is covered, per profile and merged
 ```
 
-Configured by environment, so the same binary works under systemd or by hand:
+```
+$ prewarm status
+profile             files  regions       size  held
+epiphany              412     3774       161M  warm+lock
+weblaunch             388     3509       108M  warm+lock
+auto-0                875     5402       166M  warm
+= merged             1104     6810       243M  (shared pages counted once)
+```
+
+## Configuration
+
+Entirely by environment, so the same binary works under a service manager or
+from a shell:
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `PREWARM_STATE_DIR` | `/var/lib/prewarm` | where profiles live |
-| `PREWARM_MIN_SIZE` | `0` | smallest file to record ranges for |
-| `PREWARM_PREFIX` | unset | only record mappings under this path |
+| `PREWARM_STATE_DIR` | `/var/lib/prewarm` | where `record` and `watch` write |
+| `PREWARM_PROFILE_DIRS` | state dir | `:`-separated dirs to warm **and** lock |
+| `PREWARM_WARM_ONLY_DIRS` | — | `:`-separated dirs to warm but never lock |
+| `PREWARM_WARM_DIRS` | — | `:`-separated directories to warm whole |
+| `PREWARM_MIN_SIZE` | `0` | smallest file to record regions for |
+| `PREWARM_PREFIX` | — | only record paths under this prefix |
 | `PREWARM_MAX_LOCKED` | `0` | ceiling on locked bytes, 0 for none |
-| `PREWARM_WARM_DIRS` | unset | `:`-separated dirs to warm whole |
+| `PREWARM_WATCH_INTERVAL` | `300` | seconds between samples |
+| `PREWARM_WATCH_GENERATIONS` | `6` | samples kept before one ages out |
 
-## Warm directories
+### Warming directories
 
-`warmDirs` is for data an app *reads* rather than maps -- browser profiles,
-caches, anything the pagemap recorder cannot see because it was never mapped.
-They are walked live rather than recorded, because an app rewrites its own cache
-and a recorded file list goes stale in a way `/nix/store` paths never do.
-
-This is worth more than it sounds. On a phone whose application data sits on an
-SD card, warming Home Assistant's 55 MiB profile took a cold start from 11.5s to
-4.5s -- a larger win than all the library work above.
+`warmDirs` covers data an application *reads* rather than maps — profiles,
+caches, databases. Recording cannot see those, because nothing about them
+appears in a process's page tables. They are walked live rather than recorded,
+since an application rewrites its own cache and a stored file list would go
+stale.
 
 ## NixOS
 
@@ -123,25 +110,45 @@ SD card, warming Home Assistant's 55 MiB profile took a cold start from 11.5s to
 {
     inputs.prewarm.url = "github:BeatLink/Prewarm";
 
-    # ...
-
     imports = [ inputs.prewarm.nixosModules.default ];
 
     services.prewarm = {
         enable = true;
-        group = "someone";
-        maxLocked = 224 * 1024 * 1024;
-        warmDirs = [ "/home/someone/.local/share/weblaunch" ];
+        maxLocked = 384 * 1024 * 1024;
+
+        watch.enable = true;
+
+        profiles.epiphany = {
+            files = [ "${pkgs.epiphany}/bin/epiphany" ];
+            dirs = [ "/home/someone/.local/share/epiphany" ];
+            lock = false;
+        };
     };
 }
 ```
 
+`profiles.<name>.lock = false` warms without pinning. That suits whole shared
+libraries: warming one covers every page an application might reach and costs
+only I/O, where locking it would charge RAM for the part nothing executes.
+
 The warm timer repeats, because warmed pages are evictable and nothing else
-would put them back. That is affordable because only the first pass is
-expensive: over an SD-card profile of 5504 files, warming from cold took 83.5s
-with a mmap-and-touch approach against 2.3s once resident. `posix_fadvise` is
-used instead precisely to avoid that first-pass cost -- it queues the read in
-the kernel rather than faulting each page in from userspace.
+would put them back.
+
+## Notes
+
+**Filesystem support varies, and failures are quiet.** Some filesystems ignore
+`posix_fadvise`, and on ZFS a plain read populates the ARC rather than the page
+cache — either can appear to succeed while leaving nothing resident. `prewarm`
+maps and touches pages, and reports what `mincore` confirms is present, never
+what was requested.
+
+**Sampling has a floor.** `watch` sees pages that are resident when it looks, so
+a page faulted and dropped between two samples is missed. Shorter intervals
+catch more and cost more; a sample walks every process's page tables.
+
+**Locked memory is not reclaimable.** Keep `PREWARM_MAX_LOCKED` within what the
+machine can spare — the ceiling drops whatever sorts last, so overrunning it
+loses arbitrary pages rather than the least useful ones.
 
 ## Building
 
@@ -150,9 +157,8 @@ nix build
 nix run . -- status
 ```
 
-Written in Vala. It compiles to C, which matters when the whole point is not
-spending time or memory: a Python equivalent took 839-1810 ms merely to print
-its help on the target device, against 21 ms for a native binary.
+Written in Vala, which compiles to C: a preloader that spends noticeable time or
+memory starting up defeats its own purpose.
 
 ## Licence
 
