@@ -207,6 +207,44 @@ in
                 RAM for a guarantee.
             '';
         };
+
+        watch = {
+            enable = lib.mkEnableOption ''
+                recording every running process on an interval, instead of
+                relying on `prewarm record` having been run at the right moment.
+
+                Catches what a one-off recording misses -- an application nobody
+                thought to record, a page reached only on the second run -- and
+                repairs itself across updates, since paths that stop existing
+                stop appearing in samples
+            '';
+
+            interval = lib.mkOption {
+                type = lib.types.int;
+                default = 300;
+                description = ''
+                    Seconds between samples. A sample walks every process's
+                    pagemap: measured on a PinePhone, 3.1s for 399 processes. At
+                    300s that is around 1% of one core; at 60s it is 5%, which
+                    is too much on a phone for what it adds.
+
+                    Shorter intervals catch shorter-lived pages. Anything
+                    faulted and dropped between two samples is never seen.
+                '';
+            };
+
+            generations = lib.mkOption {
+                type = lib.types.int;
+                default = 6;
+                description = ''
+                    How many samples are kept. Each cycle overwrites the oldest,
+                    and the union of all of them is what gets warmed, so a page
+                    that stops being touched falls out after this many cycles.
+
+                    With the default interval that is half an hour of history.
+                '';
+            };
+        };
     };
 
     config = lib.mkIf cfg.enable {
@@ -233,6 +271,23 @@ in
                 OnBootSec = "2min";
                 OnUnitActiveSec = cfg.interval;
                 AccuracySec = "5min";
+            };
+        };
+
+        systemd.services.prewarm-watch = lib.mkIf cfg.watch.enable {
+            description = "Record what running processes are actually touching";
+            wantedBy = [ "multi-user.target" ];
+            environment = environment // {
+                PREWARM_WATCH_INTERVAL = toString cfg.watch.interval;
+                PREWARM_WATCH_GENERATIONS = toString cfg.watch.generations;
+            };
+            serviceConfig = {
+                Type = "simple";
+                Restart = "always";
+                RestartSec = 60;
+                Nice = 19;
+                IOSchedulingClass = "idle";
+                ExecStart = "${lib.getExe cfg.package} watch";
             };
         };
 
