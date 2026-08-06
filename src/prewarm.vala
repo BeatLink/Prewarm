@@ -537,7 +537,101 @@ uint64 warm_profile (Profile profile) {
     return total;
 }
 
-uint64 warm_dir (string dir) {
+const size_t READ_CHUNK = 1 << 20;
+uint8[] read_buf;
+
+/* Read a span into the page cache or the ARC, whichever the filesystem uses,
+ * and return what was actually read rather than what was asked for. */
+uint64 read_region (int fd, uint64 off, uint64 len) {
+    uint64 done = 0;
+
+    while (done < len) {
+        var want = (size_t) uint64.min (len - done, READ_CHUNK);
+        var got = Posix.pread (fd, read_buf, want, (Posix.off_t) (off + done));
+
+        if (got <= 0) {
+            break;
+        }
+
+        done += got;
+    }
+
+    return done;
+}
+
+/* Does reading a file leave it cached anywhere that helps?
+ *
+ * Not a given. On ZFS a read populates the ARC, and a dataset set to cache
+ * metadata only discards it immediately -- so reading is pure cost, and the
+ * pages have to be mapped instead to land in the page cache. Elsewhere reading
+ * is much the cheaper of the two: measured over 2226 files, mapping and
+ * touching them read 196 MiB and took 42s, against 26 MiB and 6.2s to read
+ * them.
+ *
+ * Reads are synchronous, so unlike posix_fadvise this can simply be tried and
+ * checked -- read a file, read it again, and see whether the second one was
+ * cheap.
+ */
+bool reads_are_retained (string probe) {
+    Posix.Stat st;
+    if (Posix.stat (probe, out st) != 0 || st.st_size < 65536) {
+        return false;
+    }
+
+    int fd = Posix.open (probe, Posix.O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+
+    var t0 = get_monotonic_time ();
+    read_region (fd, 0, st.st_size);
+    var first = get_monotonic_time () - t0;
+
+    var t1 = get_monotonic_time ();
+    read_region (fd, 0, st.st_size);
+    var second = get_monotonic_time () - t1;
+
+    Posix.close (fd);
+
+    /* Anything served from memory is far more than four times faster than the
+     * card; the margin is wide enough that timing noise cannot decide it. */
+    return second * 4 < first;
+}
+
+/* Pick something big enough to time. Small files are dominated by the open. */
+string? probe_file (string dir) {
+    try {
+        var d = Dir.open (dir);
+        string? name;
+
+        while ((name = d.read_name ()) != null) {
+            var path = Path.build_filename (dir, name);
+
+            if (FileUtils.test (path, FileTest.IS_SYMLINK)) {
+                continue;
+            }
+
+            if (FileUtils.test (path, FileTest.IS_DIR)) {
+                var deeper = probe_file (path);
+                if (deeper != null) {
+                    return deeper;
+                }
+                continue;
+            }
+
+            Posix.Stat st;
+            if (Posix.stat (path, out st) == 0 && st.st_size >= 262144) {
+                return path;
+            }
+        }
+    } catch (FileError e) {
+        /* nothing to probe with */
+    }
+
+    return null;
+}
+
+uint64 warm_dir (string dir, bool by_reading) {
     uint64 total = 0;
 
     try {
@@ -552,7 +646,7 @@ uint64 warm_dir (string dir) {
             }
 
             if (FileUtils.test (path, FileTest.IS_DIR)) {
-                total += warm_dir (path);
+                total += warm_dir (path, by_reading);
                 continue;
             }
 
@@ -566,7 +660,8 @@ uint64 warm_dir (string dir) {
                 continue;
             }
 
-            total += map_region (fd, 0, st.st_size);
+            total += by_reading ? read_region (fd, 0, st.st_size)
+                                : map_region (fd, 0, st.st_size);
             Posix.close (fd);
         }
     } catch (FileError e) {
@@ -733,6 +828,7 @@ environment:
 
 int main (string[] args) {
     page_size = Posix.sysconf (Posix._SC_PAGESIZE);
+    read_buf = new uint8[READ_CHUNK];
 
     var now = new DateTime.now_utc ().to_unix ();
 
@@ -987,8 +1083,15 @@ int main (string[] args) {
             if (dir == "" || !FileUtils.test (dir, FileTest.IS_DIR)) {
                 continue;
             }
-            stdout.printf ("warmed %" + uint64.FORMAT + " MiB from %s\n",
-                           warm_dir (dir) / (1024 * 1024), dir);
+
+            /* Decided per directory, because a system can easily have one
+             * filesystem that retains reads and another that does not. */
+            var probe = probe_file (dir);
+            var by_reading = probe != null && reads_are_retained (probe);
+
+            stdout.printf ("warmed %" + uint64.FORMAT + " MiB from %s (%s)\n",
+                           warm_dir (dir, by_reading) / (1024 * 1024), dir,
+                           by_reading ? "read" : "mapped");
         }
         return 0;
 
