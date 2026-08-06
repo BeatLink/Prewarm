@@ -33,6 +33,14 @@ extern const int MMAP_PROT_READ;
 [CCode (cname = "MAP_SHARED", cheader_filename = "sys/mman.h")]
 extern const int MMAP_MAP_SHARED;
 
+[CCode (cname = "MAP_POPULATE", cheader_filename = "sys/mman.h")]
+extern const int MMAP_MAP_POPULATE;
+
+/* vec as a pointer, not uint8[]: Vala passes an implicit length alongside an
+ * array parameter, which gives mincore a fourth argument it does not have. */
+[CCode (cheader_filename = "sys/mman.h")]
+extern int mincore (void *addr, size_t length, uint8 *vec);
+
 const uint64 PAGEMAP_PRESENT = 1UL << 63;
 const uint64 PAGEMAP_SWAPPED = 1UL << 62;
 
@@ -153,6 +161,18 @@ void record_pid (StringBuilder buf, string pid, uint64 min_size, string? prefix)
 
 /* ----------------------------------------------------------------- profiles */
 
+/* Two profile formats, read by the same parser because everything downstream
+ * only ever sees ranges.
+ *
+ *   path \t offset \t length    a recorded range, from `prewarm record`
+ *   path                        a whole file, written by hand or generated
+ *
+ * The second is there so a list of files known to matter can be declared
+ * outright, with no recording step. That also survives what recording cannot: a
+ * profile of /nix/store paths is invalidated by the next update, whereas a list
+ * generated from the same expression that builds the system is rewritten with
+ * it.
+ */
 Array<Range?> read_profiles (string[] paths) {
     var all = new Array<Range?> ();
 
@@ -165,7 +185,26 @@ Array<Range?> read_profiles (string[] paths) {
 
         string line;
         while ((line = f.read_line ()) != null) {
-            var parts = line.split ("\t");
+            var trimmed = line.strip ();
+            if (trimmed == "" || trimmed.has_prefix ("#")) {
+                continue;
+            }
+
+            var parts = trimmed.split ("\t");
+
+            if (parts.length == 1) {
+                Posix.Stat st;
+                if (Posix.stat (parts[0], out st) != 0 || !Posix.S_ISREG (st.st_mode)) {
+                    continue;
+                }
+                if (st.st_size == 0) {
+                    continue;
+                }
+
+                all.append_val (Range () { path = parts[0], off = 0, len = st.st_size });
+                continue;
+            }
+
             if (parts.length != 3) {
                 continue;
             }
@@ -224,39 +263,48 @@ Array<Range?> merge (Array<Range?> input) {
 
 /* --------------------------------------------------------------- warm / lock */
 
-const size_t READ_CHUNK = 1 << 20;
-
-uint8[] read_buf;
-
-/* Plain reads, not posix_fadvise.
+/* mmap with MAP_POPULATE, and then check with mincore.
  *
- * fadvise(WILLNEED) is the obvious way to do this and is a no-op on ZFS -- the
- * call succeeds, returns in milliseconds and leaves the page cache empty, which
- * is worse than useless because it looks like it worked. Measured on an SD-card
- * profile of 5504 files: fadvise "warmed" 122 MiB in 4.6s and left residency at
- * 0%.
+ * The two obvious cheaper approaches both fail on ZFS, and fail quietly, which
+ * is the dangerous part. Measured against a 5504-file profile on an SD card,
+ * each followed by a residency check:
  *
- * Reading is also what is actually fastest here. Faulting the same profile in
- * through mmap, as vmtouch does, took 83.5s against roughly 17s to read it.
+ *   posix_fadvise(WILLNEED)    4.6s     0% resident   -- ignored outright
+ *   pread of every byte      118.8s     0% resident   -- fills the ARC, and
+ *                                                        primarycache=metadata
+ *                                                        throws it away
+ *   mmap and touch each page  83.5s    98% resident   -- works
  *
- * Returns bytes genuinely read, so a filesystem that quietly ignores this
- * cannot report success.
+ * Only mmap creates page cache pages on ZFS; reads go to the ARC instead, so on
+ * a dataset that caches metadata only they leave nothing behind. MAP_POPULATE
+ * asks the kernel to prefault the whole mapping, which is the same mechanism
+ * vmtouch drives one page at a time from userspace.
+ *
+ * Returns bytes mincore reports as actually resident, never bytes requested, so
+ * a filesystem that ignores all of this cannot report success.
  */
-uint64 read_range (int fd, uint64 off, uint64 len) {
-    uint64 done = 0;
+uint64 map_range (int fd, uint64 off, uint64 len) {
+    var addr = mmap (null, (size_t) len, MMAP_PROT_READ,
+                     MMAP_MAP_SHARED | MMAP_MAP_POPULATE, fd, (Posix.off_t) off);
 
-    while (done < len) {
-        var want = (size_t) uint64.min (len - done, READ_CHUNK);
-        var got = Posix.pread (fd, read_buf, want, (Posix.off_t) (off + done));
-
-        if (got <= 0) {
-            break;
-        }
-
-        done += got;
+    if ((long) addr == -1) {
+        return 0;
     }
 
-    return done;
+    var pages = (len + page_size - 1) / page_size;
+    var vec = new uint8[pages];
+    uint64 resident = 0;
+
+    if (mincore (addr, (size_t) len, vec) == 0) {
+        for (uint64 i = 0; i < pages; i++) {
+            if ((vec[i] & 1) != 0) {
+                resident += page_size;
+            }
+        }
+    }
+
+    munmap (addr, (size_t) len);
+    return uint64.min (resident, len);
 }
 
 uint64 warm_ranges (Array<Range?> ranges) {
@@ -279,7 +327,7 @@ uint64 warm_ranges (Array<Range?> ranges) {
             continue;
         }
 
-        total += read_range (fd, r.off, r.len);
+        total += map_range (fd, r.off, r.len);
     }
 
     if (fd >= 0) {
@@ -318,7 +366,7 @@ uint64 warm_dir (string dir) {
                 continue;
             }
 
-            total += read_range (fd, 0, st.st_size);
+            total += map_range (fd, 0, st.st_size);
             Posix.close (fd);
         }
     } catch (FileError e) {
@@ -392,21 +440,31 @@ int lock_ranges (Array<Range?> ranges, uint64 max_total) {
 
 /* --------------------------------------------------------------------- main */
 
-string[] profiles_in (string state_dir, string suffix) {
+/* Profiles are gathered from every directory named, so a read-only set built
+ * with the system can sit alongside the mutable one that recording writes to.
+ */
+string[] profiles_in (string dirs) {
     var found = new GenericArray<string> ();
 
-    try {
-        var d = Dir.open (state_dir);
-        string? name;
-        while ((name = d.read_name ()) != null) {
-            if (name.has_suffix (suffix)) {
-                found.add (Path.build_filename (state_dir, name));
-            }
+    foreach (var dir in dirs.split (":")) {
+        if (dir == "") {
+            continue;
         }
-    } catch (FileError e) {
-        /* No state directory yet is not an error -- nothing has been recorded. */
+
+        try {
+            var d = Dir.open (dir);
+            string? name;
+            while ((name = d.read_name ()) != null) {
+                if (name.has_suffix (".pages") || name.has_suffix (".files")) {
+                    found.add (Path.build_filename (dir, name));
+                }
+            }
+        } catch (FileError e) {
+            /* A directory that does not exist yet just has nothing in it. */
+        }
     }
 
+    found.sort ((a, b) => strcmp (a, b));
     return found.data;
 }
 
@@ -417,7 +475,7 @@ void usage () {
        prewarm status                   report what is recorded and resident
 
 environment:
-  PREWARM_STATE_DIR    where profiles live (default /var/lib/prewarm)
+  PREWARM_STATE_DIR    where `record` writes profiles (default /var/lib/prewarm)\n  PREWARM_PROFILE_DIRS :-separated dirs to read profiles from (default state dir)
   PREWARM_MIN_SIZE     smallest file to record ranges for, bytes (default 0)
   PREWARM_PREFIX       only record paths under this prefix
   PREWARM_MAX_LOCKED   ceiling on locked bytes, 0 for no limit
@@ -427,9 +485,10 @@ environment:
 
 int main (string[] args) {
     page_size = Posix.sysconf (Posix._SC_PAGESIZE);
-    read_buf = new uint8[READ_CHUNK];
+
 
     var state_dir = Environment.get_variable ("PREWARM_STATE_DIR") ?? "/var/lib/prewarm";
+    var profile_dirs = Environment.get_variable ("PREWARM_PROFILE_DIRS") ?? state_dir;
     var warm_dirs_raw = Environment.get_variable ("PREWARM_WARM_DIRS") ?? "";
 
     if (args.length < 2) {
@@ -481,7 +540,7 @@ int main (string[] args) {
         return 0;
 
     case "warm":
-        var ranges = merge (read_profiles (profiles_in (state_dir, ".pages")));
+        var ranges = merge (read_profiles (profiles_in (profile_dirs)));
         var bytes = warm_ranges (ranges);
         stdout.printf ("warmed %" + uint64.FORMAT + " MiB of recorded pages\n",
                        bytes / (1024 * 1024));
@@ -503,7 +562,7 @@ int main (string[] args) {
             uint64.try_parse (max_raw, out max_total);
         }
 
-        var to_lock = merge (read_profiles (profiles_in (state_dir, ".pages")));
+        var to_lock = merge (read_profiles (profiles_in (profile_dirs)));
         if (to_lock.length == 0) {
             printerr ("prewarm: nothing recorded to lock\n");
             return 0;
@@ -512,7 +571,7 @@ int main (string[] args) {
         return lock_ranges (to_lock, max_total);
 
     case "status":
-        var profiles = profiles_in (state_dir, ".pages");
+        var profiles = profiles_in (profile_dirs);
         stdout.printf ("%-16s %8s %10s\n", "profile", "ranges", "size");
 
         foreach (var p in profiles) {
@@ -522,7 +581,7 @@ int main (string[] args) {
                 bytes += one.index (i).len;
             }
             stdout.printf ("%-16s %8u %9" + uint64.FORMAT + "M\n",
-                           Path.get_basename (p).replace (".pages", ""),
+                           Path.get_basename (p).replace (".pages", "").replace (".files", ""),
                            one.length, bytes / (1024 * 1024));
         }
 

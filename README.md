@@ -12,10 +12,30 @@ Two mechanisms, kept separate because they cost different things:
 
 | | how | cost | guarantee |
 | --- | --- | --- | --- |
-| `warm` | `posix_fadvise(WILLNEED)` | free to hold | none, pages are evictable |
+| `warm` | `mmap` + `MAP_POPULATE` | free to hold | none, pages are evictable |
 | `lock` | `mmap` + `mlock` | charged against RAM | resident until the process exits |
 
-Both work from the same recorded profiles.
+Both work from the same profiles.
+
+### Why mmap, and not something cheaper
+
+Both obvious shortcuts fail on ZFS, and fail *quietly*, which is the dangerous
+part -- they return success having done nothing. Measured against a 5504-file
+profile on an SD card, each followed by an independent residency check:
+
+| approach | time | resident after |
+| --- | --- | --- |
+| `posix_fadvise(WILLNEED)` | 4.6s | **0%** -- ignored outright |
+| `pread` of every byte | 118.8s | **0%** -- fills the ARC, which `primarycache=metadata` discards |
+| `mmap` + touch each page | 83.5s | 98% |
+
+Only `mmap` creates page cache pages on ZFS; reads go to the ARC instead, so on
+a dataset caching metadata only they leave nothing behind. `MAP_POPULATE` asks
+the kernel to prefault the mapping rather than driving it a page at a time from
+userspace, as `vmtouch` does.
+
+`warm` reports bytes `mincore` confirms are resident, never bytes requested, so
+a filesystem that ignores all of this cannot report success.
 
 ## Why page ranges rather than files
 
@@ -41,15 +61,39 @@ once, which is most of the value on a system where everything is GTK: recording
 Epiphany gave 109 MiB, and adding Files, Secrets and Settings on top cost only
 16 MiB more, because they land on pages already covered.
 
-## Usage
+## Two ways to say what matters
+
+**Record it**, when you do not already know:
 
 ```sh
 # Start the app, use it, then record what it touched.
 prewarm record epiphany $(pgrep 'epiphany|WebKit')
+```
 
-prewarm warm      # read the recorded pages back in
+**Declare it**, when you do. A profile can be a plain list of paths, one per
+line, `#` for comments -- no recording step, and whole files rather than ranges:
+
+```
+# /etc/prewarm/epiphany.files
+/nix/store/…-epiphany-50.4/bin/epiphany
+/nix/store/…-webkitgtk-2.52.5/lib/libwebkitgtk-6.0.so.4
+```
+
+Declaring is the better default where the answer is obvious, because it is the
+only one that survives an update: a recorded profile names exact store paths and
+is silently invalidated the next time they change, whereas a declared list
+generated from the same expression that builds the system is rewritten with it.
+
+Recording still wins where the answer is not obvious -- it captures the pages
+actually faulted in rather than whole files. Both formats are read by the same
+parser and merged together, so a system can use each where it fits.
+
+## Usage
+
+```sh
+prewarm warm      # read the profiles back into the page cache
 prewarm lock      # hold them with mlock; runs until killed
-prewarm status    # what is recorded, per profile and merged
+prewarm status    # what is covered, per profile and merged
 ```
 
 Configured by environment, so the same binary works under systemd or by hand:

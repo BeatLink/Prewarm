@@ -19,12 +19,28 @@ self:
 let
     cfg = config.services.prewarm;
 
+    named = lib.filterAttrs (_: p: p.files != [ ]) cfg.profiles;
+
+    # One file per profile rather than one big list, so `prewarm status` can
+    # still report them apart -- which is the point of naming them.
+    declared = pkgs.linkFarm "prewarm-profiles" (
+        lib.mapAttrsToList (name: p: {
+            name = "${name}.files";
+            path = pkgs.writeText "${name}.files" (lib.concatLines p.files);
+        }) named
+    );
+
+    allWarmDirs = cfg.warmDirs ++ lib.concatMap (p: p.dirs) (lib.attrValues cfg.profiles);
+
     environment =
         {
             PREWARM_STATE_DIR = cfg.stateDir;
+            PREWARM_PROFILE_DIRS = lib.concatStringsSep ":" (
+                [ cfg.stateDir ] ++ lib.optional (named != { }) "${declared}"
+            );
             PREWARM_MIN_SIZE = toString cfg.minSize;
             PREWARM_MAX_LOCKED = toString cfg.maxLocked;
-            PREWARM_WARM_DIRS = lib.concatStringsSep ":" cfg.warmDirs;
+            PREWARM_WARM_DIRS = lib.concatStringsSep ":" allWarmDirs;
         }
         // lib.optionalAttrs (cfg.prefix != null) { PREWARM_PREFIX = cfg.prefix; };
 in
@@ -84,6 +100,56 @@ in
                 whatever sorts last by path, which is arbitrary rather than
                 least useful.
             '';
+        };
+
+        profiles = lib.mkOption {
+            default = { };
+            description = ''
+                Named sets of things to keep resident, declared rather than
+                recorded.
+
+                Worth preferring to `prewarm record` where you already know what
+                an application needs. A recorded profile names exact
+                /nix/store paths and is invalidated by the next update, with
+                nothing to notice that it has been; a declared one is written
+                from the same expression that builds the system, so it is
+                rewritten whenever those paths change.
+
+                Recorded profiles still win where the answer is not obvious --
+                they carry the pages actually faulted in, rather than whole
+                files. The two are read together and merged.
+            '';
+            example = lib.literalExpression ''
+                {
+                    epiphany = {
+                        files = [ "''${pkgs.epiphany}/bin/epiphany" ];
+                        dirs = [ "/home/someone/.local/share/epiphany" ];
+                    };
+                }
+            '';
+            type = lib.types.attrsOf (
+                lib.types.submodule {
+                    options = {
+                        files = lib.mkOption {
+                            type = lib.types.listOf lib.types.str;
+                            default = [ ];
+                            description = ''
+                                Files to keep resident whole. Missing paths are
+                                skipped, so listing something optional is safe.
+                            '';
+                        };
+
+                        dirs = lib.mkOption {
+                            type = lib.types.listOf lib.types.str;
+                            default = [ ];
+                            description = ''
+                                Directories to warm whole, walked live. Warmed
+                                only, never locked -- see warmDirs.
+                            '';
+                        };
+                    };
+                }
+            );
         };
 
         warmDirs = lib.mkOption {
