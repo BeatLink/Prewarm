@@ -157,6 +157,48 @@ class Profile : Object {
         order = kept_order;
     }
 
+    /* Drop pages the file can no longer back, and files that are gone outright.
+     * Ageing alone does not catch these: a store path that a nixpkgs bump
+     * replaced is still being sampled under its new size, so its stale pages
+     * keep their last-seen stamp and never age out. Returns pages dropped. */
+    public uint sweep () {
+        var kept_order = new GenericArray<string> ();
+        uint dropped = 0;
+
+        foreach (var path in order) {
+            var pages = files.lookup (path);
+
+            Posix.Stat st;
+            if (Posix.stat (path, out st) != 0 || st.st_size <= 0) {
+                dropped += pages.length;
+                files.remove (path);
+                continue;
+            }
+
+            var last = ((uint64) st.st_size + page_size - 1) / page_size;
+            var kept = new GenericArray<Page?> ();
+
+            foreach (var p in pages) {
+                if (p.index < last) {
+                    kept.add (p);
+                }
+            }
+
+            dropped += pages.length - kept.length;
+
+            if (kept.length == 0) {
+                files.remove (path);
+                continue;
+            }
+
+            files.replace (path, kept);
+            kept_order.add (path);
+        }
+
+        order = kept_order;
+        return dropped;
+    }
+
     /* Consecutive pages agreeing on hits and last-seen collapse into one run,
      * which is what gets written and what warm and lock iterate. */
     public GenericArray<Run?> runs_for (string path) {
@@ -491,7 +533,36 @@ void whole_file (Profile profile, string path, int64 now) {
  */
 uint8 touch_sink;
 
+/* Trim a recorded region to what the file currently holds, returning 0 if it
+ * begins past the end.
+ *
+ * Recorded regions are page-rounded and the file they describe is whatever is
+ * on disk now, so a region can outlive the size it was recorded against -- a
+ * nixpkgs bump rotates a store path, and the profile still names the old
+ * extents. mmap does not object: it rounds the mapping up to a page boundary
+ * without consulting the file length, so the overrun only shows up on access.
+ * Bytes past the end within the file's final page read as zero, but a page
+ * wholly past it has nothing behind it and faulting one raises SIGBUS. */
+uint64 clamp_to_file (int fd, uint64 off, uint64 len) {
+    Posix.Stat st;
+    if (Posix.fstat (fd, out st) != 0 || st.st_size <= 0) {
+        return 0;
+    }
+
+    var size = (uint64) st.st_size;
+    if (off >= size) {
+        return 0;
+    }
+
+    return uint64.min (len, size - off);
+}
+
 uint64 map_region (int fd, uint64 off, uint64 len) {
+    len = clamp_to_file (fd, off, len);
+    if (len == 0) {
+        return 0;
+    }
+
     var addr = mmap (null, (size_t) len, MMAP_PROT_READ, MMAP_MAP_SHARED, fd, (Posix.off_t) off);
     if ((long) addr == -1) {
         return 0;
@@ -699,7 +770,7 @@ int lock_profile (Profile profile, uint64 max_total) {
     });
 
     uint64 locked = 0, skipped = 0;
-    uint mapped = 0, failed = 0;
+    uint mapped = 0, failed = 0, stale = 0;
     string? open_path = null;
     int fd = -1;
 
@@ -722,21 +793,27 @@ int lock_profile (Profile profile, uint64 max_total) {
             continue;
         }
 
-        var addr = mmap (null, (size_t) c.len, MMAP_PROT_READ, MMAP_MAP_SHARED,
+        var len = clamp_to_file (fd, c.off, c.len);
+        if (len == 0) {
+            stale++;
+            continue;
+        }
+
+        var addr = mmap (null, (size_t) len, MMAP_PROT_READ, MMAP_MAP_SHARED,
                          fd, (Posix.off_t) c.off);
         if ((long) addr == -1) {
             failed++;
             continue;
         }
 
-        if (mlock (addr, (size_t) c.len) != 0) {
+        if (mlock (addr, (size_t) len) != 0) {
             printerr ("prewarm: mlock %s: %s\n", c.path, Posix.strerror (Posix.errno));
-            munmap (addr, (size_t) c.len);
+            munmap (addr, (size_t) len);
             failed++;
             continue;
         }
 
-        locked += c.len;
+        locked += len;
         mapped++;
     }
 
@@ -751,6 +828,9 @@ int lock_profile (Profile profile, uint64 max_total) {
                    locked / 1024, mapped, profile.order.length);
     if (skipped != 0) {
         stdout.printf (", skipped %" + uint64.FORMAT + " KiB least used", skipped / 1024);
+    }
+    if (stale != 0) {
+        stdout.printf (", %u stale", stale);
     }
     if (failed != 0) {
         stdout.printf (", %u failed", failed);
@@ -1061,13 +1141,18 @@ int main (string[] args) {
 
             profile.consolidate ();
             profile.prune (stamp - retention);
+            var swept = profile.sweep ();
             write_profile (auto_path, profile);
 
             stdout.printf ("%s: %u processes, %u pages in %u files, %" + uint64.FORMAT
-                           + " MiB (%+d pages)\n",
+                           + " MiB (%+d pages)",
                            why, sampled, profile.page_count (), profile.order.length,
                            profile.total_bytes () / (1024 * 1024),
                            (int) profile.page_count () - (int) known);
+            if (swept != 0) {
+                stdout.printf (", swept %u stale", swept);
+            }
+            stdout.printf ("\n");
             stdout.flush ();
 
             next_scheduled = new DateTime.now_utc ().to_unix () + interval;
