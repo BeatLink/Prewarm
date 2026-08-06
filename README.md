@@ -153,12 +153,31 @@ loses arbitrary pages rather than the least useful ones.
 ## Building
 
 ```sh
+make && sudo make install
+```
+
+Needs `valac` and glib. There is a flake too, if you want it:
+
+```sh
 nix build
 nix run . -- status
 ```
 
 Written in Vala, which compiles to C: a preloader that spends noticeable time or
 memory starting up defeats its own purpose.
+
+## Portability
+
+Linux only — it reads `/proc/PID/pagemap`, and `mincore`, `mlock` and `mmap` do
+the rest. No filesystem, distribution or package manager is assumed.
+
+Warming maps and touches pages because that is the one method that works
+everywhere. On filesystems that honour it, `posix_fadvise(WILLNEED)` would be
+considerably cheaper; on others it is silently ignored, and on ZFS a plain read
+populates the ARC rather than the page cache, so neither leaves anything
+resident. Correctness everywhere was worth more than speed on some, and
+`mincore` verification means a filesystem that ignores the request is reported
+rather than assumed to have worked.
 
 ## Licence
 
