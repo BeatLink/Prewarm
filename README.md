@@ -1,5 +1,7 @@
 # prewarm
 
+<a href="https://liberapay.com/BeatLink/donate"><img alt="Donate using Liberapay" src="https://liberapay.com/assets/widgets/donate.svg"></a>
+
 Keeps the pages your applications need resident, so starting them does not wait
 on storage.
 
